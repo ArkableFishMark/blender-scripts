@@ -1,4 +1,5 @@
 import bpy
+import os
 
 def is_target_suffix(node, suffix):
     """Case-insensitive check if the node name or its loaded image base-name ends with the suffix."""
@@ -37,15 +38,96 @@ def has_bump_setup(node):
                 return True
     return False
 
-def configure_base_color_alpha(bsdf):
-    """Finds the Image Texture node plugged into the Base Color input and sets its alpha mode to Channel Packed."""
+def has_normal_map_setup(node):
+    """Check if the normal texture node is already connected to a Normal Map node."""
+    if 'Color' in node.outputs:
+        for link in node.outputs['Color'].links:
+            if link.to_node.type == 'NORMAL_MAP':
+                return True
+    return False
+
+def configure_base_color_alpha(mat, bsdf):
+    """Sets Base Color texture to Channel Packed and routes its Alpha output directly to the BSDF Alpha input."""
     base_color_input = bsdf.inputs.get('Base Color')
     if base_color_input and base_color_input.is_linked:
-        # Trace back to the node connected directly to the Base Color socket
         from_node = base_color_input.links[0].from_node
         if from_node.type == 'TEX_IMAGE' and from_node.image:
             if from_node.image.alpha_mode != 'CHANNEL_PACKED':
                 from_node.image.alpha_mode = 'CHANNEL_PACKED'
+            
+            alpha_input = bsdf.inputs.get('Alpha')
+            if alpha_input and not alpha_input.is_linked:
+                if 'Alpha' in from_node.outputs:
+                    mat.node_tree.links.new(from_node.outputs['Alpha'], alpha_input)
+
+def auto_load_textures_from_dir(mat, base_node):
+    """Scans the Base Color texture directory for matching _n, _sp, or hairspecshift maps and imports them if missing."""
+    if not base_node.image or not base_node.image.filepath:
+        return
+        
+    nodes = mat.node_tree.nodes
+    bx, by = base_node.location
+    
+    filepath = bpy.path.abspath(base_node.image.filepath)
+    dir_path = os.path.dirname(filepath)
+    if not os.path.exists(dir_path):
+        return
+        
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
+    base_name_lower = base_name.lower()
+    
+    diffuse_suffixes = ['_hair', '_d', '_diff', '_col', '_color', '_albedo', '_basecolor', '_base', '_c', '_diffuse']
+    root_name = base_name_lower
+    for s in diffuse_suffixes:
+        if base_name_lower.endswith(s):
+            root_name = base_name_lower[:-len(s)]
+            break
+            
+    valid_extensions = {'.png', '.jpg', '.jpeg', '.dds', '.tga', '.tif', '.tiff', '.bmp'}
+    
+    for filename in os.listdir(dir_path):
+        f_name, f_ext = os.path.splitext(filename)
+        if f_ext.lower() not in valid_extensions:
+            continue
+            
+        f_name_lower = f_name.lower()
+        target_suffix = None
+        
+        if f_name_lower.endswith('_n') and (root_name in f_name_lower or base_name_lower in f_name_lower):
+            target_suffix = '_n'
+        elif f_name_lower.endswith('_sp') and (root_name in f_name_lower or base_name_lower in f_name_lower):
+            target_suffix = '_sp'
+        elif 'hairspecshift' in f_name_lower and (root_name in f_name_lower or root_name.split('_')[0] in f_name_lower):
+            target_suffix = 'hairspecshift'
+            
+        if not target_suffix:
+            continue
+            
+        full_path = os.path.join(dir_path, filename)
+        
+        already_loaded = False
+        for n in nodes:
+            if n.type == 'TEX_IMAGE' and n.image and n.image.filepath:
+                if os.path.normpath(bpy.path.abspath(n.image.filepath)) == os.path.normpath(full_path):
+                    already_loaded = True
+                    break
+                    
+        if not already_loaded:
+            try:
+                img = bpy.data.images.load(full_path)
+                new_node = nodes.new(type='ShaderNodeTexImage')
+                new_node.image = img
+                new_node.name = img.name 
+                
+                if target_suffix == '_n':
+                    new_node.location = (bx, by - 320)
+                elif target_suffix == '_sp':
+                    new_node.location = (bx, by - 640)
+                elif target_suffix == 'hairspecshift':
+                    new_node.location = (bx - 350, by - 640)
+                    
+            except Exception as e:
+                print(f"Failed to auto-load texture map {filename}: {e}")
 
 def setup_materials_in_hierarchy(start_obj):
     # 1. Collect all objects in the hierarchy
@@ -53,7 +135,7 @@ def setup_materials_in_hierarchy(start_obj):
     for obj in objects:
         objects.extend(obj.children)
         
-    # 2. Collect unique node-based materials from those objects
+    # 2. Collect unique node-based materials
     materials = set()
     for obj in objects:
         if obj.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}:
@@ -66,25 +148,30 @@ def setup_materials_in_hierarchy(start_obj):
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         
-        # Find the Principled BSDF node to attach things to
+        # Find the Principled BSDF node
         bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if not bsdf:
-            continue # Skip materials without a Principled BSDF
+            continue
             
-        # --- NEW: Process the Base Color node's Alpha Mode ---
-        configure_base_color_alpha(bsdf)
+        # Process the Base Color node's Alpha Mode and auto-link Alpha channel
+        configure_base_color_alpha(mat, bsdf)
+        
+        # Locate Base Color node and dynamically ingest maps from directory
+        base_color_input = bsdf.inputs.get('Base Color')
+        if base_color_input and base_color_input.is_linked:
+            from_node = base_color_input.links[0].from_node
+            if from_node.type == 'TEX_IMAGE':
+                auto_load_textures_from_dir(mat, from_node)
             
-        for node in nodes:
-            # --- Process Image Textures ---
+        # Main Processing Loop
+        for node in list(nodes): 
             if node.type == 'TEX_IMAGE':
-                # Convert any Linear interpolation to Cubic globally
                 if getattr(node, 'interpolation', None) == 'Linear':
                     node.interpolation = 'Cubic'
                 
                 is_n = is_target_suffix(node, '_n')
                 is_sp = is_target_suffix(node, '_sp')
                 is_hair_spec = is_target_contains(node, 'hairspecshift')
-                # Target textures containing "hair" but NOT the spec shift texture
                 is_hair_base = is_target_contains(node, 'hair') and not is_hair_spec
                 
                 # --- Apply Utility Map Settings (Non-Color Data) ---
@@ -92,20 +179,43 @@ def setup_materials_in_hierarchy(start_obj):
                     node.interpolation = 'Cubic' 
                     if node.image:
                         node.image.colorspace_settings.name = 'Non-Color'
+                
+                # --- Apply Normal Map Setup Logic ---
+                if is_n:
+                    if not has_normal_map_setup(node):
+                        x, y = node.location
+                        nm_node = nodes.new(type="ShaderNodeNormalMap")
+                        nm_node.location = (x + 300, y)
+                        
+                        if bpy.app.version >= (5, 0, 0) and hasattr(nm_node, 'convention'):
+                            nm_node.convention = 'DIRECTX'
+                            
+                        links.new(node.outputs['Color'], nm_node.inputs['Color'])
+                        
+                        if 'Normal' in bsdf.inputs:
+                            normal_input = bsdf.inputs['Normal']
+                            if normal_input.is_linked:
+                                target_node = normal_input.links[0].from_node
+                                if target_node.type == 'BUMP' and 'Normal' in target_node.inputs:
+                                    links.new(nm_node.outputs['Normal'], target_node.inputs['Normal'])
+                            else:
+                                links.new(nm_node.outputs['Normal'], normal_input)
                         
                 # --- Apply Channel Splitting Logic (_sp or hairspecshift) ---
                 if is_sp or is_hair_spec:
+                    # --- NEW: Set Specular Tint default color to #9B9B9BFF (0.33 linear) ---
+                    if 'Specular Tint' in bsdf.inputs:
+                        bsdf.inputs['Specular Tint'].default_value = (0.33, 0.33, 0.33, 1.0)
+                        
                     if has_separate_color_setup(node):
-                        continue # Skip building if setup already exists
+                        continue 
                         
                     x, y = node.location
                     
-                    # 1. Add Separate Color node
                     sep_color = nodes.new(type="ShaderNodeSeparateColor")
                     sep_color.location = (x + 300, y)
                     links.new(node.outputs['Color'], sep_color.inputs['Color'])
                     
-                    # 2. Handle Red channel routing based on texture case
                     if is_sp:
                         bc_node = nodes.new(type="ShaderNodeBrightContrast")
                         bc_node.location = (x + 500, y + 100)
@@ -119,36 +229,37 @@ def setup_materials_in_hierarchy(start_obj):
                         if 'Roughness' in bsdf.inputs:
                             links.new(sep_color.outputs['Red'], bsdf.inputs['Roughness'])
                         
-                    # 3. Connect Green -> Specular IOR Level (or Specular)
                     spec_input = bsdf.inputs.get('Specular IOR Level') or bsdf.inputs.get('Specular')
                     if spec_input:
                         links.new(sep_color.outputs['Green'], spec_input)
                         
-                    # 4. Connect Blue -> Metallic
                     if 'Metallic' in bsdf.inputs:
                         links.new(sep_color.outputs['Blue'], bsdf.inputs['Metallic'])
 
                 # --- Apply Hair Base Color Pseudo-Bump Logic ---
                 if is_hair_base:
                     if has_bump_setup(node):
-                        continue # Skip building if bump setup already exists
+                        continue 
                     
                     x, y = node.location
-                    
-                    # 1. Add Bump node
                     bump_node = nodes.new(type="ShaderNodeBump")
                     bump_node.location = (x + 300, y - 250)
                     bump_node.inputs['Distance'].default_value = 0.0075
                     
-                    # 2. Connect Alpha output to Bump Height input
                     if 'Alpha' in node.outputs:
                         links.new(node.outputs['Alpha'], bump_node.inputs['Height'])
                         
-                    # 3. Connect Bump Normal output to Principled BSDF Normal input
                     if 'Normal' in bsdf.inputs:
-                        links.new(bump_node.outputs['Normal'], bsdf.inputs['Normal'])
+                        normal_input = bsdf.inputs['Normal']
+                        if normal_input.is_linked:
+                            target_node = normal_input.links[0].from_node
+                            if target_node.type == 'NORMAL_MAP':
+                                links.new(target_node.outputs['Normal'], bump_node.inputs['Normal'])
+                                links.new(bump_node.outputs['Normal'], normal_input)
+                        else:
+                            links.new(bump_node.outputs['Normal'], normal_input)
             
-            # --- Blender 5.0+ DirectX for Normal Maps ---
+            # --- Blender 5.0+ Global DirectX Enforcement for Normal Maps ---
             if node.type == 'NORMAL_MAP' and bpy.app.version >= (5, 0, 0):
                 if hasattr(node, 'convention'):
                     if node.convention != 'DIRECTX':
