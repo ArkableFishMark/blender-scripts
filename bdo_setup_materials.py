@@ -1,24 +1,53 @@
 import bpy
 import os
+import re
+
+def clean_asset_name(s):
+    """
+    Recursively strips Blender's numerical duplicate suffixes (.001) and 
+    standard texture extensions to isolate the true core name of the asset.
+    Example: 'PWW_00_Cloak_0173_n.dds.001' -> 'pww_00_cloak_0173_n'
+    """
+    if not s:
+        return ""
+    s = os.path.basename(s).lower()
+    
+    while True:
+        base, ext = os.path.splitext(s)
+        if not ext:
+            break
+        # Strip Blender duplicate markers (.001, .002, etc.)
+        if re.match(r'^\.\d+$', ext):
+            s = base
+            continue
+        # Strip standard texture extensions
+        if ext in {'.png', '.jpg', '.jpeg', '.dds', '.tga', '.tif', '.tiff', '.bmp'}:
+            s = base
+            continue
+        break
+    return s
 
 def is_target_suffix(node, suffix):
-    """Case-insensitive check if the node name or its loaded image base-name ends with the suffix."""
+    """Case and suffix-insulated check if the node or its image matches a specific map suffix."""
     suffix = suffix.lower()
-    if node.name.lower().endswith(suffix):
+    if clean_asset_name(node.name).endswith(suffix):
         return True
     if getattr(node, 'image', None):
-        base_name = node.image.name.rsplit('.', 1)[0].lower()
-        if base_name.endswith(suffix):
+        if clean_asset_name(node.image.name).endswith(suffix):
+            return True
+        if clean_asset_name(node.image.filepath).endswith(suffix):
             return True
     return False
 
 def is_target_contains(node, substring):
-    """Case-insensitive check if the node name or its loaded image name contains a specific substring."""
+    """Case and suffix-insulated substring validation check across names and paths."""
     substring = substring.lower()
-    if substring in node.name.lower():
+    if substring in clean_asset_name(node.name):
         return True
     if getattr(node, 'image', None):
-        if substring in node.image.name.lower():
+        if substring in clean_asset_name(node.image.name):
+            return True
+        if substring in clean_asset_name(node.image.filepath):
             return True
     return False
 
@@ -61,7 +90,7 @@ def configure_base_color_alpha(mat, bsdf):
                     mat.node_tree.links.new(from_node.outputs['Alpha'], alpha_input)
 
 def auto_load_textures_from_dir(mat, base_node):
-    """Scans the Base Color texture directory for matching _n, _sp, or hairspecshift maps and imports them if missing."""
+    """Scans the Base Color texture directory for matching maps and safely imports them without duplication."""
     if not base_node.image or not base_node.image.filepath:
         return
         
@@ -73,31 +102,33 @@ def auto_load_textures_from_dir(mat, base_node):
     if not os.path.exists(dir_path):
         return
         
-    base_name = os.path.splitext(os.path.basename(filepath))[0]
-    base_name_lower = base_name.lower()
+    # Sanitize our base node reference name
+    base_name_clean = clean_asset_name(filepath)
     
     diffuse_suffixes = ['_hair', '_d', '_diff', '_col', '_color', '_albedo', '_basecolor', '_base', '_c', '_diffuse']
-    root_name = base_name_lower
+    root_name = base_name_clean
     for s in diffuse_suffixes:
-        if base_name_lower.endswith(s):
-            root_name = base_name_lower[:-len(s)]
+        if base_name_clean.endswith(s):
+            root_name = base_name_clean[:-len(s)]
             break
             
     valid_extensions = {'.png', '.jpg', '.jpeg', '.dds', '.tga', '.tif', '.tiff', '.bmp'}
     
     for filename in os.listdir(dir_path):
-        f_name, f_ext = os.path.splitext(filename)
-        if f_ext.lower() not in valid_extensions:
+        f_name_clean = clean_asset_name(filename)
+        
+        # Ensure it contains a valid file extension somewhere in the string structure
+        has_valid_ext = any(ext in filename.lower() for ext in valid_extensions)
+        if not has_valid_ext:
             continue
             
-        f_name_lower = f_name.lower()
         target_suffix = None
         
-        if f_name_lower.endswith('_n') and (root_name in f_name_lower or base_name_lower in f_name_lower):
+        if f_name_clean.endswith('_n') and (root_name in f_name_clean or base_name_clean in f_name_clean):
             target_suffix = '_n'
-        elif f_name_lower.endswith('_sp') and (root_name in f_name_lower or base_name_lower in f_name_lower):
+        elif f_name_clean.endswith('_sp') and (root_name in f_name_clean or base_name_clean in f_name_clean):
             target_suffix = '_sp'
-        elif 'hairspecshift' in f_name_lower and (root_name in f_name_lower or root_name.split('_')[0] in f_name_lower):
+        elif 'hairspecshift' in f_name_clean and (root_name in f_name_clean or root_name.split('_')[0] in f_name_clean):
             target_suffix = 'hairspecshift'
             
         if not target_suffix:
@@ -105,10 +136,19 @@ def auto_load_textures_from_dir(mat, base_node):
             
         full_path = os.path.join(dir_path, filename)
         
+        # --- Multi-Layered Idempotency Check ---
         already_loaded = False
+        current_scan_path = os.path.normpath(bpy.path.abspath(full_path)).lower()
+        
         for n in nodes:
             if n.type == 'TEX_IMAGE' and n.image and n.image.filepath:
-                if os.path.normpath(bpy.path.abspath(n.image.filepath)) == os.path.normpath(full_path):
+                existing_node_path = os.path.normpath(bpy.path.abspath(n.image.filepath)).lower()
+                # 1. Path Match
+                if existing_node_path == current_scan_path:
+                    already_loaded = True
+                    break
+                # 2. Parsed Clean Name Match (catches pre-existing .001 nodes)
+                if clean_asset_name(n.image.name) == f_name_clean:
                     already_loaded = True
                     break
                     
@@ -203,7 +243,6 @@ def setup_materials_in_hierarchy(start_obj):
                         
                 # --- Apply Channel Splitting Logic (_sp or hairspecshift) ---
                 if is_sp or is_hair_spec:
-                    # --- NEW: Set Specular Tint default color to #9B9B9BFF (0.33 linear) ---
                     if 'Specular Tint' in bsdf.inputs:
                         bsdf.inputs['Specular Tint'].default_value = (0.33, 0.33, 0.33, 1.0)
                         
@@ -268,6 +307,6 @@ def setup_materials_in_hierarchy(start_obj):
 # Execute the script
 if bpy.context.active_object:
     setup_materials_in_hierarchy(bpy.context.active_object)
-    print("Successfully processed materials for the hierarchy!")
+    print("Hierarchy cleanup finalized! Block duplicates safely filtered out.")
 else:
     print("Warning: Please select an active object as the root of the hierarchy.")
